@@ -1,9 +1,9 @@
 
 import pandas as pd
-from .legacy_scanner import run_for_streamlit
+from scanner.legacy_scanner import run_for_streamlit_tables
 
-def run_scan() -> pd.DataFrame:
+def run_scan():
     """
-    Streamlit 呼叫的唯一入口
+    給 app.py 呼叫：回傳四個表格 + meta/error
     """
-    return run_for_streamlit()
+    return run_for_streamlit_tables()
