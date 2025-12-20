@@ -27,13 +27,13 @@ BOT_N         = 5
 # 1) fapi.binance.com：官方
 # 2) fapi.binance.vision：常見鏡像（如果可用會救命；不可用也不影響，會自動跳下一個）
 BASE_CANDIDATES = [
-    "https://fapi.binance.com",
-    "https://fapi.binance.vision",
+    "https://data-api.binance.vision",  # ✅ 雲端常可用的 Binance data mirror
+    "https://fapi.binance.com",         # ✅ 官方期貨（可能會被擋，留作備援）
 ]
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "scanner/1.0",
+    "User-Agent": "Mozilla/5.0 (scanner/1.0)",  # ✅ 稍微像瀏覽器一點
     "Accept": "application/json",
 })
 
