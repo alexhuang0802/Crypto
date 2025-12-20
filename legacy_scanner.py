@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pytz
 
 # ====== 設定區 ======
-BOT_TOKEN = "8041061344:AAEaPljQwnvWI8QJnkt_q3VBz1RmU14KDB8"
+BOT_TOKEN = " "
 CHAT_ID = [
 
 ]
@@ -387,7 +387,3 @@ def scheduler_loop():
         print(f"[{datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S%z')}] 休息 {interval//3600} 小時…\n")
         time.sleep(interval)
 
-if __name__ == "__main__":
-
-    run_once()
-    # scheduler_loop()
