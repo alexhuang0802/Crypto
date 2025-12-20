@@ -3,7 +3,7 @@ from scanner.core import run_scan
 
 st.set_page_config(page_title="Crypto Scanner", layout="wide")
 
-st.title("🚀 Crypto — MACD 背離 + 資費套利 掃描工具")
+st.title("🚀 Crypto — MACD 背離 掃描工具")
 st.write("點擊下方按鈕，直接執行掃描並在頁面上顯示結果。")
 
 if st.button("🚀 開始掃描"):
