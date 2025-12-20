@@ -24,7 +24,7 @@ session.headers.update({
     "User-Agent": "scanner/1.0",
     "Accept": "application/json",
 })
-
+print("### legacy_scanner VERSION = 2025-12-20 v2 ###")
 def get_json(url, params=None, timeout=20, retries=2, backoff=1.5):
     """
     Cloud 上常遇到 403/429，這裡做 retry；
