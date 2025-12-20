@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-legacy_scanner.py (Streamlit 版 - Spot API)
-- 只做：Binance Spot 1h K 線 MACD 背離掃描（USDT 交易對）
-- 參數固定：KLINE_LIMIT=720, interval=1h, lookback=40, recent_bars=5
-- 移除：BingX 資金費率 / OI 排行 / Telegram 發送 / scheduler loop
-- 目的：讓 Streamlit Cloud 上能穩定跑並在頁面顯示結果
+legacy_scanner.py (Streamlit 版 - Spot API with fallback endpoints)
+- 只做：Spot 1h K 線 MACD 背離掃描（USDT）
+- 解決：Streamlit Cloud 直連 api.binance.com 可能被 451/403/429 擋
+- 做法：多個 base endpoint 失敗自動切換
 """
 
 import time
@@ -14,14 +13,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ====== 固定參數（照你原本寫死） ======
 KLINE_LIMIT   = 720
-QUOTE_VOL_MIN = 5_000_000          # 24h quoteVolume 過濾
-MAX_WORKERS   = 6                  # Cloud 建議不要太大
-EXCLUDED      = {"USDCUSDT", "USDPUSDT"}  # 可自行加黑名單
+QUOTE_VOL_MIN = 5_000_000
+MAX_WORKERS   = 4
+EXCLUDED      = {"USDCUSDT", "USDPUSDT"}
 LOOKBACK      = 40
 RECENT_BARS   = 5
 
-# ====== Binance Spot Base URL ======
-SPOT_BASE = "https://api.binance.com"
+# ====== 多個 endpoint（會自動 fallback） ======
+# 1) data-api.binance.vision：常見可用的 Binance data mirror（雲端較不容易被 451）
+# 2) api.binance.com：官方（你現在會 451，留著當備援）
+BASE_CANDIDATES = [
+    "https://data-api.binance.vision",
+    "https://api.binance.com",
+]
 
 session = requests.Session()
 session.headers.update({
@@ -29,26 +33,32 @@ session.headers.update({
     "Accept": "application/json",
 })
 
-def get_json(url, params=None, timeout=20, retries=3, backoff=1.2):
+def _request_json(base: str, path: str, params=None, timeout=20):
+    url = f"{base}{path}"
+    r = session.get(url, params=params, timeout=timeout)
+    if r.status_code >= 400:
+        text = (r.text or "")[:300]
+        raise requests.HTTPError(f"HTTP {r.status_code} for {url} params={params} body={text}")
+    return r.json()
+
+def get_json(path: str, params=None, timeout=20, retries=2, backoff=1.2):
     """
-    帶 retry + 回傳更好 debug 的錯誤訊息
+    會依序嘗試 BASE_CANDIDATES，成功就回傳
+    全部失敗才 raise
     """
     last_err = None
-    for i in range(retries):
-        try:
-            r = session.get(url, params=params, timeout=timeout)
-            if r.status_code >= 400:
-                text = (r.text or "")[:300]
-                raise requests.HTTPError(
-                    f"HTTP {r.status_code} for {url} params={params} body={text}"
-                )
-            return r.json()
-        except Exception as e:
-            last_err = e
-            time.sleep(backoff * (i + 1))
+    for base in BASE_CANDIDATES:
+        for i in range(retries):
+            try:
+                return _request_json(base, path, params=params, timeout=timeout)
+            except Exception as e:
+                last_err = e
+                time.sleep(backoff * (i + 1))
+                continue
+        # 這個 base 多次失敗 -> 換下一個
     raise last_err
 
-# ====== MACD 計算 ======
+# ====== MACD ======
 def get_macd(df, fast=12, slow=26, signal=9):
     ema_fast = df["Close"].ewm(span=fast, adjust=False).mean()
     ema_slow = df["Close"].ewm(span=slow, adjust=False).mean()
@@ -58,9 +68,6 @@ def get_macd(df, fast=12, slow=26, signal=9):
     return macd, sig, hist
 
 def has_bullish_line_divergence(df, lookback=LOOKBACK, recent=RECENT_BARS):
-    """
-    低段線背離：價格破低、MACD 不破低（且發生在最近 RECENT_BARS 根內）
-    """
     for i in range(lookback, len(df)):
         window = df.iloc[i - lookback:i]
         prior_idx = window["Low"].idxmin()
@@ -73,9 +80,6 @@ def has_bullish_line_divergence(df, lookback=LOOKBACK, recent=RECENT_BARS):
     return False
 
 def has_bearish_line_divergence(df, lookback=LOOKBACK, recent=RECENT_BARS):
-    """
-    高段線背離：價格不創高（或創高幅度弱）、MACD 創高（且發生在最近 RECENT_BARS 根內）
-    """
     for i in range(lookback, len(df)):
         window = df.iloc[i - lookback:i]
         prior_idx = window["High"].idxmax()
@@ -87,19 +91,15 @@ def has_bearish_line_divergence(df, lookback=LOOKBACK, recent=RECENT_BARS):
                 return True
     return False
 
-# ====== 取 Spot 交易對清單（USDT） ======
+# ====== Spot symbols ======
 def fetch_spot_symbols_usdt():
-    """
-    回傳：["BTCUSDT", "ETHUSDT", ...]
-    """
-    ex = get_json(f"{SPOT_BASE}/api/v3/exchangeInfo", timeout=20)
+    ex = get_json("/api/v3/exchangeInfo", timeout=20)
     symbols = []
     for s in ex.get("symbols", []):
         if s.get("status") != "TRADING":
             continue
         if s.get("quoteAsset") != "USDT":
             continue
-        # Spot 沒有 contractType，這邊就是現貨交易對
         sym = s.get("symbol")
         if not sym:
             continue
@@ -108,18 +108,15 @@ def fetch_spot_symbols_usdt():
         symbols.append(sym)
     return symbols
 
-# ====== 單一幣種掃描（Spot 1h） ======
 def process_symbol(symbol: str):
     try:
-        # 1) 24hr ticker 取成交金額過濾（quoteVolume）
-        t24 = get_json(f"{SPOT_BASE}/api/v3/ticker/24hr", {"symbol": symbol}, timeout=15)
+        t24 = get_json("/api/v3/ticker/24hr", {"symbol": symbol}, timeout=15)
         quote_vol = float(t24.get("quoteVolume", 0.0))
         if quote_vol < QUOTE_VOL_MIN:
             return None
 
-        # 2) K 線
         k = get_json(
-            f"{SPOT_BASE}/api/v3/klines",
+            "/api/v3/klines",
             {"symbol": symbol, "interval": "1h", "limit": KLINE_LIMIT},
             timeout=25,
         )
@@ -148,24 +145,17 @@ def process_symbol(symbol: str):
         if bear:
             hits.append({"Symbol": symbol, "Signal": "🔴 線背離(高段)", "Type": "BEAR", "Vol": quote_vol})
         return hits or None
-
     except Exception:
         return None
 
-# ====== Streamlit 用的主入口：回傳 DataFrame ======
 def run_for_streamlit() -> pd.DataFrame:
-    """
-    給 app.py 呼叫用：回傳 DataFrame
-    欄位：Symbol, Signal, Type, Vol
-    """
     try:
         symbols = fetch_spot_symbols_usdt()
-
         if not symbols:
             return pd.DataFrame([{
                 "Symbol": "",
-                "Signal": "⚠️ 沒抓到任何 USDT 交易對",
-                "Type": "",
+                "Signal": "⚠️ 沒抓到任何 USDT 交易對（exchangeInfo 可能仍被擋）",
+                "Type": "NO_SYMBOLS",
                 "Vol": 0,
             }])
 
@@ -176,7 +166,7 @@ def run_for_streamlit() -> pd.DataFrame:
                 res = fut.result()
                 if res:
                     rows.extend(res)
-                time.sleep(0.01)  # 稍微放慢，避免被 API 拒絕
+                time.sleep(0.01)
 
         if not rows:
             return pd.DataFrame([{
@@ -187,15 +177,10 @@ def run_for_streamlit() -> pd.DataFrame:
             }])
 
         df = pd.DataFrame(rows)
-
-        # 依成交額排序（大的在前）
-        if "Vol" in df.columns:
-            df = df.sort_values(by="Vol", ascending=False).reset_index(drop=True)
-
+        df = df.sort_values(by="Vol", ascending=False).reset_index(drop=True)
         return df[["Symbol", "Signal", "Type", "Vol"]]
 
     except Exception as e:
-        # 不要讓 Streamlit 整頁紅，改成回傳一列錯誤資訊
         return pd.DataFrame([{
             "Symbol": "",
             "Signal": "❌ 掃描失敗（請看 Type 欄位錯誤）",
