@@ -1,10 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 legacy_scanner.py (Streamlit 版 - Spot API with fallback endpoints)
-- 只做：Spot 1h K 線 MACD 背離掃描（USDT）
-- 解決：Streamlit Cloud 直連 api.binance.com 可能被 451/403/429 擋
-- 做法：多個 base endpoint 失敗自動切換
-- 輸出：只顯示「有命中」後的成交量 Top5 + Bottom5（最多 10 筆）
+
+- 只做：Spot 1h K 線（USDT）MACD 線背離掃描
+- 同時支援：
+  - 低檔背離（做多留意）  -> BULL
+  - 高檔背離（做空留意）  -> BEAR
+- 輸出限制（你指定）：
+  - 低檔：成交量前五大 + 前五小（最多 10）
+  - 高檔：成交量前五大 + 前五小（最多 10）
+  => 全部最多 20 筆
+- 額外顯示：目前價格 Price（從 /ticker/24hr 的 lastPrice 來）
+- 解決：Streamlit Cloud 直連 Binance 常見 451/403/429
+  -> 用多個 base endpoint 失敗自動切換
 """
 
 import time
@@ -16,15 +24,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 KLINE_LIMIT   = 720
 QUOTE_VOL_MIN = 5_000_000
 MAX_WORKERS   = 4
-EXCLUDED      = {"USDCUSDT", "USDPUSDT"}
+EXCLUDED      = {"USDCUSDT", "USDPUSDT"}  # 你要 TWT 就不要排除它
 LOOKBACK      = 40
 RECENT_BARS   = 5
 
-# 你要的名額
-TOP_N = 5
-BOTTOM_N = 5
+TOP_N = 5  # 成交量前五大
+BOT_N = 5  # 成交量前五小
 
-# ====== 多個 endpoint（會自動 fallback） ======
+# ====== 多個 endpoint（會自動 fallback）=====
+# 建議把 data-api.binance.vision 放第一個（雲端比較不容易 451）
 BASE_CANDIDATES = [
     "https://data-api.binance.vision",
     "https://api.binance.com",
@@ -57,8 +65,9 @@ def get_json(path: str, params=None, timeout=20, retries=2, backoff=1.2):
             except Exception as e:
                 last_err = e
                 time.sleep(backoff * (i + 1))
-                continue
+        # 這個 base 多次失敗 -> 換下一個
     raise last_err
+
 
 # ====== MACD ======
 def get_macd(df, fast=12, slow=26, signal=9):
@@ -71,16 +80,16 @@ def get_macd(df, fast=12, slow=26, signal=9):
 
 def has_bullish_line_divergence(df, lookback=LOOKBACK, recent=RECENT_BARS):
     """
-    低檔背離（做多留意）：
-    價格創更低 Low，但 MACD 創更高（背離）
-    且訊號發生在最近 recent 根內
+    低檔背離（做多留意）
+    近 lookback 內：價格創更低 Low，但 MACD 沒創更低（MACD 變高）
     """
     for i in range(lookback, len(df)):
         window = df.iloc[i - lookback:i]
         prior_idx = window["Low"].idxmin()
+
         if (
-            df["Low"].iloc[i] < df["Low"].iloc[prior_idx]
-            and df["MACD"].iloc[i] > df["MACD"].iloc[prior_idx]
+            df["Low"].iloc[i] < df["Low"].loc[prior_idx]
+            and df["MACD"].iloc[i] > df["MACD"].loc[prior_idx]
         ):
             if i >= len(df) - recent:
                 return True
@@ -88,20 +97,21 @@ def has_bullish_line_divergence(df, lookback=LOOKBACK, recent=RECENT_BARS):
 
 def has_bearish_line_divergence(df, lookback=LOOKBACK, recent=RECENT_BARS):
     """
-    高檔背離（做空留意）：
-    價格沒有創更高 High（<= 前高），但 MACD 創更高（背離）
-    且訊號發生在最近 recent 根內
+    高檔背離（做空留意）
+    近 lookback 內：MACD 創更高，但價格 High 沒創更高（或更低）
     """
     for i in range(lookback, len(df)):
         window = df.iloc[i - lookback:i]
         prior_idx = window["High"].idxmax()
+
         if (
-            df["MACD"].iloc[i] > df["MACD"].iloc[prior_idx]
-            and df["High"].iloc[i] <= df["High"].iloc[prior_idx]
+            df["MACD"].iloc[i] > df["MACD"].loc[prior_idx]
+            and df["High"].iloc[i] <= df["High"].loc[prior_idx]
         ):
             if i >= len(df) - recent:
                 return True
     return False
+
 
 # ====== Spot symbols ======
 def fetch_spot_symbols_usdt():
@@ -112,6 +122,7 @@ def fetch_spot_symbols_usdt():
             continue
         if s.get("quoteAsset") != "USDT":
             continue
+
         sym = s.get("symbol")
         if not sym:
             continue
@@ -120,18 +131,22 @@ def fetch_spot_symbols_usdt():
         symbols.append(sym)
     return symbols
 
+
 def process_symbol(symbol: str):
     """
     回傳 list[dict] 或 None
-    dict: {Symbol, Signal, Type, Vol}
-    Type: BULL / BEAR
+    每個 dict 會包含：Symbol / Signal / Type / Vol / Price
     """
     try:
+        # 24hr ticker 同時拿到成交量與 lastPrice（你要的目前價格）
         t24 = get_json("/api/v3/ticker/24hr", {"symbol": symbol}, timeout=15)
         quote_vol = float(t24.get("quoteVolume", 0.0))
+        last_price = float(t24.get("lastPrice", 0.0))
+
         if quote_vol < QUOTE_VOL_MIN:
             return None
 
+        # K 線
         k = get_json(
             "/api/v3/klines",
             {"symbol": symbol, "interval": "1h", "limit": KLINE_LIMIT},
@@ -158,64 +173,86 @@ def process_symbol(symbol: str):
 
         hits = []
         if bull:
-            hits.append({"Symbol": symbol, "Signal": "🟢 低檔背離(做多留意)", "Type": "BULL", "Vol": quote_vol})
+            hits.append({
+                "Symbol": symbol,
+                "Signal": "🟢 線背離(低段)",
+                "Type": "BULL",
+                "Vol": quote_vol,
+                "Price": last_price,
+            })
         if bear:
-            hits.append({"Symbol": symbol, "Signal": "🔴 高檔背離(做空留意)", "Type": "BEAR", "Vol": quote_vol})
+            hits.append({
+                "Symbol": symbol,
+                "Signal": "🔴 線背離(高段)",
+                "Type": "BEAR",
+                "Vol": quote_vol,
+                "Price": last_price,
+            })
 
         return hits or None
 
     except Exception:
         return None
 
-def _merge_same_symbol(rows: list[dict]) -> pd.DataFrame:
+
+def _pick_top_bottom(df: pd.DataFrame, n_top=TOP_N, n_bot=BOT_N) -> pd.DataFrame:
     """
-    同一個 Symbol 若同時 bull/bear，合併成一筆，Signal 串起來
+    針對同一類（BULL 或 BEAR）：
+    - 取成交量前 n_top
+    - 取成交量前 n_bot（最小）
+    回傳最多 n_top + n_bot（且去重 Symbol）
     """
-    if not rows:
-        return pd.DataFrame(columns=["Symbol", "Signal", "Type", "Vol"])
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Bucket", "Symbol", "Price", "Signal", "Type", "Vol"])
 
-    df = pd.DataFrame(rows)
-    # 合併 Signal / Type
-    agg = df.groupby("Symbol", as_index=False).agg({
-        "Signal": lambda s: " / ".join(sorted(set(map(str, s)))),
-        "Type":   lambda s: ",".join(sorted(set(map(str, s)))),
-        "Vol":    "max",
-    })
-    return agg[["Symbol", "Signal", "Type", "Vol"]]
+    df = df.sort_values("Vol", ascending=False).copy()
 
-def _pick_top_bottom(df: pd.DataFrame, top_n=TOP_N, bottom_n=BOTTOM_N) -> pd.DataFrame:
-    """
-    只保留成交量 Top N + Bottom N
-    """
-    if df.empty:
-        return df
+    top_df = df.head(n_top).copy()
+    bot_df = df.sort_values("Vol", ascending=True).head(n_bot).copy()
 
-    df2 = df.sort_values(by="Vol", ascending=False).reset_index(drop=True)
+    # 去重：如果 top/bot 有重複（例如資料太少），避免重複出現
+    used = set()
+    rows = []
 
-    top_df = df2.head(top_n)
+    for _, r in top_df.iterrows():
+        sym = r["Symbol"]
+        if sym in used:
+            continue
+        used.add(sym)
+        rows.append({**r.to_dict(), "Bucket": "📊 成交量前五大"})
 
-    # bottom 從小到大
-    bot_df = df2.sort_values(by="Vol", ascending=True).head(bottom_n)
+    for _, r in bot_df.iterrows():
+        sym = r["Symbol"]
+        if sym in used:
+            continue
+        used.add(sym)
+        rows.append({**r.to_dict(), "Bucket": "📉 成交量前五小"})
 
-    # 合併後去重（避免 top/bottom 重覆）
-    out = pd.concat([top_df, bot_df], ignore_index=True)
-    out = out.drop_duplicates(subset=["Symbol"]).reset_index(drop=True)
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(columns=["Bucket", "Symbol", "Price", "Signal", "Type", "Vol"])
 
-    # 最後再按 Vol 大到小看起來更直觀
-    out = out.sort_values(by="Vol", ascending=False).reset_index(drop=True)
+    # 排序：先前五大再前五小；各自內部再依 Vol 排序
+    bucket_order = {"📊 成交量前五大": 0, "📉 成交量前五小": 1}
+    out["_bucket_order"] = out["Bucket"].map(bucket_order).fillna(9)
+    out = out.sort_values(by=["_bucket_order", "Vol"], ascending=[True, False]).drop(columns=["_bucket_order"])
     return out
+
 
 def run_for_streamlit() -> pd.DataFrame:
     """
-    給 Streamlit 呼叫：回傳一個 DataFrame
+    給 Streamlit 用：回傳已整理好的表格
+    欄位：Category / Bucket / Signal / Symbol / Price / Vol
     """
     try:
         symbols = fetch_spot_symbols_usdt()
         if not symbols:
             return pd.DataFrame([{
-                "Symbol": "",
+                "Category": "",
+                "Bucket": "",
                 "Signal": "⚠️ 沒抓到任何 USDT 交易對（exchangeInfo 可能仍被擋）",
-                "Type": "NO_SYMBOLS",
+                "Symbol": "",
+                "Price": 0,
                 "Vol": 0,
             }])
 
@@ -228,23 +265,57 @@ def run_for_streamlit() -> pd.DataFrame:
                     rows.extend(res)
                 time.sleep(0.01)
 
-        # 只顯示命中，沒命中就給提示
         if not rows:
             return pd.DataFrame([{
+                "Category": "",
+                "Bucket": "",
+                "Signal": "（無命中）",
                 "Symbol": "",
-                "Signal": "（本次無命中背離訊號）",
-                "Type": "",
+                "Price": 0,
                 "Vol": 0,
             }])
 
-        df = _merge_same_symbol(rows)
-        df = _pick_top_bottom(df, top_n=TOP_N, bottom_n=BOTTOM_N)
-        return df[["Symbol", "Signal", "Type", "Vol"]]
+        df = pd.DataFrame(rows)
+
+        # 分別處理 BULL / BEAR，並限制每類只輸出 10（5大+5小）
+        bull_df = df[df["Type"] == "BULL"].copy()
+        bear_df = df[df["Type"] == "BEAR"].copy()
+
+        bull_out = _pick_top_bottom(bull_df, TOP_N, BOT_N)
+        bear_out = _pick_top_bottom(bear_df, TOP_N, BOT_N)
+
+        if not bull_out.empty:
+            bull_out.insert(0, "Category", "📈 低段線背離（做多留意）")
+        if not bear_out.empty:
+            bear_out.insert(0, "Category", "📉 高段線背離（做空留意）")
+
+        out = pd.concat([bull_out, bear_out], ignore_index=True)
+
+        if out.empty:
+            return pd.DataFrame([{
+                "Category": "",
+                "Bucket": "",
+                "Signal": "（無命中）",
+                "Symbol": "",
+                "Price": 0,
+                "Vol": 0,
+            }])
+
+        # 欄位排序（你要看起來像之前 console 那樣：先類別、再成交量多/少）
+        out = out[["Category", "Bucket", "Signal", "Symbol", "Price", "Vol"]].copy()
+
+        # 讓 Price / Vol 數字更好看（可選：不想格式化可刪）
+        out["Price"] = pd.to_numeric(out["Price"], errors="coerce").fillna(0.0)
+        out["Vol"] = pd.to_numeric(out["Vol"], errors="coerce").fillna(0.0)
+
+        return out
 
     except Exception as e:
         return pd.DataFrame([{
+            "Category": "",
+            "Bucket": "",
+            "Signal": "❌ 掃描失敗（請看錯誤訊息）",
             "Symbol": "",
-            "Signal": "❌ 掃描失敗（請看 Type 欄位錯誤）",
-            "Type": str(e),
+            "Price": 0,
             "Vol": 0,
-        }])
+        }]).assign(Error=str(e))
