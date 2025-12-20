@@ -206,48 +206,49 @@ def process_symbol(symbol):
         return None
 
 
-# ✅✅✅ Streamlit 專用入口（最重要）
 def run_for_streamlit():
     """
-    Streamlit 專用：單次掃描、回傳 DataFrame
-    - 不排程
-    - 不發 TG
-    - API 失敗會回傳錯誤 DataFrame，而不是讓 app 掛掉
+    Streamlit 專用：
+    - Binance API 被擋也不會紅畫面
+    - 一定回傳 DataFrame
     """
 
-    # 1) 優先 exchangeInfo
-    symbols = []
+    # ===== Step 1: 取得交易對 =====
     try:
-        ex = get_json("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=30)
+        ex = get_json(
+            "https://fapi.binance.com/fapi/v1/exchangeInfo",
+            timeout=20,
+            retries=2
+        )
+
         sym_objs = [
-            s for s in ex["symbols"]
+            s for s in ex.get("symbols", [])
             if s.get("quoteAsset") == "USDT"
             and s.get("contractType") == "PERPETUAL"
             and s.get("status") == "TRADING"
-            and s["symbol"] not in EXCLUDED
+            and s.get("symbol") not in EXCLUDED
         ]
         symbols = [s["symbol"] for s in sym_objs]
 
-    except Exception as e1:
-        # 2) fallback：ticker/24hr
-        try:
-            tickers = get_json("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=30)
-            for t in tickers:
-                sym = t.get("symbol")
-                if sym and sym.endswith("USDT") and sym not in EXCLUDED:
-                    symbols.append(sym)
-        except Exception as e2:
-            return pd.DataFrame([{
-                "Symbol": "",
-                "Signal": "❌ Binance API 取得交易對失敗",
-                "Type": f"{str(e1)[:120]} | {str(e2)[:120]}",
-            }])
+        if not symbols:
+            raise RuntimeError("symbols list is empty")
 
-    # 3) 掃描
+    except Exception as e:
+        # 🚑 Binance 擋 IP → 直接回傳錯誤表格
+        return pd.DataFrame([{
+            "Symbol": "",
+            "Signal": "❌ Binance API 被限制",
+            "Type": str(e)[:200]
+        }])
+
+    # ===== Step 2: 掃描 =====
     bull_list, bear_list = [], []
+
     try:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(process_symbol, sym) for sym in symbols]
+            futures = [executor.submit(process_symbol, sym) for sym in symbols[:60]]
+            # ⬆️ 故意只掃前 60 檔，避免 429
+
             for fut in as_completed(futures):
                 res = fut.result()
                 if res:
@@ -260,19 +261,27 @@ def run_for_streamlit():
     except Exception as e:
         return pd.DataFrame([{
             "Symbol": "",
-            "Signal": "❌ 掃描過程失敗（可能限流/被擋）",
-            "Type": str(e)[:200],
+            "Signal": "❌ 掃描過程中斷",
+            "Type": str(e)[:200]
         }])
 
-    # 4) 組成 DataFrame
+    # ===== Step 3: 組 DataFrame =====
     rows = []
     for r in bull_list:
         rows.append({"Symbol": r["Symbol"], "Signal": r["訊號"], "Type": "Bullish"})
     for r in bear_list:
         rows.append({"Symbol": r["Symbol"], "Signal": r["訊號"], "Type": "Bearish"})
 
-    df = pd.DataFrame(rows, columns=["Symbol", "Signal", "Type"])
-    return df.sort_values(by=["Type", "Symbol"]).reset_index(drop=True)
+    if not rows:
+        return pd.DataFrame([{
+            "Symbol": "",
+            "Signal": "⚠️ 本次未掃描到任何背離",
+            "Type": "OK"
+        }])
+
+    return pd.DataFrame(rows).sort_values(
+        by=["Type", "Symbol"]
+    ).reset_index(drop=True)
 
 
 # 保留原本排程/發訊版本（Streamlit 不會用到）
