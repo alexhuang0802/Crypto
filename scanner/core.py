@@ -1,13 +1,9 @@
 
 import pandas as pd
-from .legacy_scanner import scan_macd_main  # 假設你原本主程式叫這個
+from .legacy_scanner import run_for_streamlit
 
-def run_scan(timeframe="15m", limit=200):
+def run_scan() -> pd.DataFrame:
     """
-    Streamlit 專用入口
+    Streamlit 呼叫的唯一入口
     """
-    result = scan_macd_main(
-        timeframe=timeframe,
-        limit=limit
-    )
-    return pd.DataFrame(result)
+    return run_for_streamlit()
