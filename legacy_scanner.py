@@ -120,47 +120,6 @@ def fetch_open_interest_change(symbol):
         return None
 
 
-# ====== BingX 資費（保留，不給 Streamlit 用）=====
-def _norm_symbol(s: str) -> str:
-    return str(s).replace("-", "").replace("_", "").upper()
-
-
-def _parse_bingx_payload(payload):
-    out = []
-    if not isinstance(payload, dict):
-        return out
-    data = payload.get("data")
-    if data is None:
-        return out
-    rows = data if isinstance(data, list) else [data]
-    for item in rows:
-        if not isinstance(item, dict):
-            continue
-        sym = item.get("symbol")
-        rate = item.get("fundingRate", item.get("lastFundingRate", None))
-        if sym and rate:
-            try:
-                out.append({"symbol": _norm_symbol(sym), "fundingRate": float(rate)})
-            except:
-                pass
-    return out
-
-
-def fetch_bingx_funding_rates(max_workers=8, per_symbol_fallback=False):
-    endpoints = [
-        "https://open-api.bingx.com/openApi/swap/v2/market/fundingRate",
-        "https://open-api.bingx.com/openApi/swap/v2/quote/premiumIndex",
-    ]
-    for url in endpoints:
-        try:
-            payload = get_json(url, timeout=15)
-            rows = _parse_bingx_payload(payload)
-            if rows:
-                return rows
-        except:
-            continue
-    return []
-
 
 # ====== 掃描單一 symbol ======
 def process_symbol(symbol):
