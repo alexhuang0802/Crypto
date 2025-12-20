@@ -386,3 +386,56 @@ def scheduler_loop():
         interval = 3*3600 if 0 <= hour < 6 else 2*3600
         print(f"[{datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S%z')}] 休息 {interval//3600} 小時…\n")
         time.sleep(interval)
+def run_for_streamlit():
+    """
+    給 Streamlit 用的單次掃描版本
+    - 不排程
+    - 不發 Telegram
+    - 回傳 pandas.DataFrame
+    """
+
+    # 期貨名單（USDT 永續）
+    ex = get_json("https://fapi.binance.com/fapi/v1/exchangeInfo")
+    sym_objs = [
+        s for s in ex["symbols"]
+        if s.get("quoteAsset") == "USDT"
+        and s.get("contractType") == "PERPETUAL"
+        and s.get("status") == "TRADING"
+        and s["symbol"] not in EXCLUDED
+    ]
+    symbols = [s["symbol"] for s in sym_objs]
+
+    bull_list, bear_list = [], []
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(process_symbol, sym) for sym in symbols]
+        for fut in as_completed(futures):
+            res = fut.result()
+            if res:
+                for item in res:
+                    if "低段" in item["訊號"]:
+                        bull_list.append(item)
+                    elif "高段" in item["訊號"]:
+                        bear_list.append(item)
+
+    # 整理成 DataFrame（給 Streamlit 顯示）
+    rows = []
+    for r in bull_list:
+        rows.append({
+            "Symbol": r["Symbol"],
+            "Signal": r["訊號"],
+            "Type": "Bullish"
+        })
+    for r in bear_list:
+        rows.append({
+            "Symbol": r["Symbol"],
+            "Signal": r["訊號"],
+            "Type": "Bearish"
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=["Symbol", "Signal", "Type"])
+
+    df = pd.DataFrame(rows)
+    return df.sort_values(by=["Type", "Symbol"]).reset_index(drop=True)
+
