@@ -35,6 +35,19 @@ MIN_BODY_TO_RANGE = 0.0
 # API 剛更新緩衝（避免剛收線但 API 還沒同步）
 GRACE_SECONDS = 10
 
+# 吞噬K的實體 必須 >= 被吞K的幾倍
+# 1.0 = 只要比他大就好
+# 1.2 = 至少大20%
+# 1.5 = 至少大50%
+MIN_ENGULF_BODY_RATIO = 1.3
+
+# 做多：上引線（壞）不得超過實體的幾倍；下引線（好）可放寬到幾倍
+MAX_BAD_WICK_TO_BODY_LONG  = 1.0   # 上引線 <= 1x body
+MAX_GOOD_WICK_TO_BODY_LONG = 3.0   # 下引線 <= 3x body（放寬）
+
+# 做空：下引線（壞）不得超過實體的幾倍；上引線（好）可放寬到幾倍
+MAX_BAD_WICK_TO_BODY_SHORT  = 1.0  # 下引線 <= 1x body
+MAX_GOOD_WICK_TO_BODY_SHORT = 3.0  # 上引線 <= 3x body（放寬）
 # =========================================================
 # Output control
 # =========================================================
@@ -54,8 +67,6 @@ TG_BOT_TOKEN = "8041061344:AAEaPljQwnvWI8QJnkt_q3VBz1RmU14KDB8"
 
 # 你的群組/對話 chat_id（注意很多群是 -100xxxxxxxxxx）
 TG_CHAT_IDS = [
-     #-4735365587,   # 貓大管理群
-     #-4866055460,  # 雙alex
      -5227897042 #莉莉老師 帶你賺錢
 ]
 
@@ -67,15 +78,15 @@ SEND_TG_ONLY_IF_NEW = False
 # Symbols
 # =========================================================
 BINGX_SWAP_SYMBOLS = {
-    "1000PEPEUSDT": "1000PEPE-USDT",
+    #"1000PEPEUSDT": "1000PEPE-USDT",
      "ETHUSDT": "ETH-USDT",
      "BTCUSDT": "BTC-USDT",
-     "UNIUSDT": "UNI-USDT",
+     #"UNIUSDT": "UNI-USDT",
      "BNBUSDT": "BNB-USDT",
      "XRPUSDT": "XRP-USDT",
      "SOLUSDT": "SOL-USDT",
-     "TRXUSDT": "TRX-USDT",
-     "DOGEUSDT": "DOGE-USDT",
+    # "TRXUSDT": "TRX-USDT",
+     #"DOGEUSDT": "DOGE-USDT",
 }
 
 # =========================================================
@@ -110,7 +121,32 @@ def interval_to_ms(interval: str) -> int:
 
 def is_green(o, c): return c > o
 def is_red(o, c): return c < o
+def wick_ok_by_direction(o, h, l, c, direction: str) -> bool:
+    """
+    direction = "LONG" or "SHORT"
+    LONG:  上引線(壞)限制嚴格；下引線(好)放寬
+    SHORT: 下引線(壞)限制嚴格；上引線(好)放寬
+    """
+    o = float(o); h = float(h); l = float(l); c = float(c)
 
+    body = abs(c - o)
+    if body <= 1e-12:  # 幾乎沒實體(十字/極小K) 直接不合格
+        return False
+
+    upper_wick = max(0.0, h - max(o, c))
+    lower_wick = max(0.0, min(o, c) - l)
+
+    if direction == "LONG":
+        # 壞：上引線；好：下引線
+        return (upper_wick <= body * MAX_BAD_WICK_TO_BODY_LONG) and \
+               (lower_wick <= body * MAX_GOOD_WICK_TO_BODY_LONG)
+
+    if direction == "SHORT":
+        # 壞：下引線；好：上引線
+        return (lower_wick <= body * MAX_BAD_WICK_TO_BODY_SHORT) and \
+               (upper_wick <= body * MAX_GOOD_WICK_TO_BODY_SHORT)
+
+    return False
 def body_to_range_ratio(o, h, l, c) -> float:
     rng = max(h - l, 1e-12)
     body = abs(c - o)
@@ -296,7 +332,33 @@ def is_bullish_engulf(prev, cur, mode: str) -> bool:
     # body
     return (cur_o <= prev_c) and (cur_c >= prev_o)
 
+def wick_body_ok(o, h, l, c, max_wick_to_body: float = 1.0) -> bool:
+    """
+    回傳 True 表示這根K棒的上下引線都不會超過實體。
+    規則：upper_wick <= body*max_ratio 且 lower_wick <= body*max_ratio
+    """
+    o = float(o); h = float(h); l = float(l); c = float(c)
+
+    body = abs(c - o)
+    if body <= 1e-12:  # doji 或近乎沒實體：直接視為不合格
+        return False
+
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+
+    # 避免資料異常造成負值
+    upper_wick = max(0.0, upper_wick)
+    lower_wick = max(0.0, lower_wick)
+
+    return (upper_wick <= body * max_wick_to_body) and (lower_wick <= body * max_wick_to_body)
+
 def compute_signal_only_if_last2_engulf(df45_closed: pd.DataFrame, symbol: str) -> Signal | None:
+    """
+    只看最後兩根 45m：
+    - 必須吞噬
+    - 吞噬K實體必須明顯大於被吞K（避免差不多長的假吞噬）
+    """
+
     if len(df45_closed) < 2:
         return None
 
@@ -306,11 +368,24 @@ def compute_signal_only_if_last2_engulf(df45_closed: pd.DataFrame, symbol: str) 
     prev_o, prev_h, prev_l, prev_c = map(float, [prev["open"], prev["high"], prev["low"], prev["close"]])
     cur_o,  cur_h,  cur_l,  cur_c  = map(float, [cur["open"],  cur["high"],  cur["low"],  cur["close"]])
 
-    ratio = body_to_range_ratio(cur_o, cur_h, cur_l, cur_c)
-    body_ok = (ratio >= MIN_BODY_TO_RANGE)
+    prev_body = abs(prev_c - prev_o)
+    cur_body  = abs(cur_c - cur_o)
 
-    bear = body_ok and is_bearish_engulf(prev, cur, ENGULF_MODE)
-    bull = body_ok and is_bullish_engulf(prev, cur, ENGULF_MODE)
+    # ❌ 排除：實體太小
+    if cur_body <= 1e-12 or prev_body <= 1e-12:
+        return None
+
+    # ❌ 排除：吞噬強度不足（你現在要的重點）
+    if cur_body < prev_body * MIN_ENGULF_BODY_RATIO:
+        return None
+
+    # 原本實體比例濾網
+    ratio = body_to_range_ratio(cur_o, cur_h, cur_l, cur_c)
+    if ratio < MIN_BODY_TO_RANGE:
+        return None
+
+    bear = is_bearish_engulf(prev, cur, ENGULF_MODE)
+    bull = is_bullish_engulf(prev, cur, ENGULF_MODE)
 
     if not (bear or bull):
         return None
@@ -319,6 +394,7 @@ def compute_signal_only_if_last2_engulf(df45_closed: pd.DataFrame, symbol: str) 
     cur_ct = pd.Timestamp(cur["close_time"]).tz_convert("UTC")
 
     entry = cur_c
+
     if bear:
         direction = "SHORT"
         stop = cur_h * (1 + CRYPTO_STOP_BUFFER)
@@ -327,7 +403,7 @@ def compute_signal_only_if_last2_engulf(df45_closed: pd.DataFrame, symbol: str) 
             return None
         tp1 = entry - r
         tp2 = entry - 2 * r
-        reason = "bearish engulfing"
+        reason = f"bearish engulfing | strong body x{MIN_ENGULF_BODY_RATIO}"
     else:
         direction = "LONG"
         stop = cur_l * (1 - CRYPTO_STOP_BUFFER)
@@ -336,7 +412,7 @@ def compute_signal_only_if_last2_engulf(df45_closed: pd.DataFrame, symbol: str) 
             return None
         tp1 = entry + r
         tp2 = entry + 2 * r
-        reason = "bullish engulfing"
+        reason = f"bullish engulfing | strong body x{MIN_ENGULF_BODY_RATIO}"
 
     return Signal(
         symbol=symbol,
@@ -351,7 +427,6 @@ def compute_signal_only_if_last2_engulf(df45_closed: pd.DataFrame, symbol: str) 
         r=abs(r),
         reason=reason,
     )
-
 # =========================================================
 # Plot (optional)
 # =========================================================
@@ -422,7 +497,12 @@ def run_every_45m():
         save_state(state)
         time.sleep(45 * 60)
 
-if __name__ == "__main__":
+#if __name__ == "__main__":
     # ✅ 開機先測試 TG，讓你立刻知道 token/chat_id/權限有沒有問題
 
-    run_every_45m()
+  #  run_every_45m()
+    
+if __name__ == "__main__":
+    state = load_state()
+    scan_once(state)
+    save_state(state)
