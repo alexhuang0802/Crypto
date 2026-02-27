@@ -3,3 +3,4 @@ packaging<24
 pandas
 numpy
 requests
+matplotlib
