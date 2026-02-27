@@ -6,7 +6,9 @@ import requests
 import pandas as pd
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+import pytz  # ✅ 用來抓台灣時間並精準等到收線點
 
 print("=== VERSION: BINGX | ONLY last 2 CLOSED 45m | SIGNAL only if ENGULFING | SIGNAL-ONLY OUTPUT | TG DEBUG ===")
 
@@ -67,7 +69,7 @@ TG_BOT_TOKEN = "8041061344:AAEaPljQwnvWI8QJnkt_q3VBz1RmU14KDB8"
 
 # 你的群組/對話 chat_id（注意很多群是 -100xxxxxxxxxx）
 TG_CHAT_IDS = [
-     -5227897042 #莉莉老師 帶你賺錢
+     -5227897042 # 莉莉老師 帶你賺錢
 ]
 
 # ✅ TG 是否只送「NEW」訊號？
@@ -121,6 +123,29 @@ def interval_to_ms(interval: str) -> int:
 
 def is_green(o, c): return c > o
 def is_red(o, c): return c < o
+
+def wait_until_next_45m_close(grace_seconds: int = 10, tz_name: str = "Asia/Taipei"):
+    """
+    ✅ 核心：就算 GitHub Actions 提早/延後觸發，也會等到「下一個45分收線點 + grace_seconds」才開始算/發訊號
+    45 分收線點（台灣時間）例：
+    00:00, 00:45, 01:30, 02:15, 03:00, 03:45, ...（每45分鐘）
+    """
+    tz = pytz.timezone(tz_name)
+    now = datetime.now(tz)
+
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    minutes_since = int((now - day_start).total_seconds() // 60)
+
+    # 下一個 45 分倍數的分鐘點（以今日 00:00 為基準）
+    next_bucket = (minutes_since // 45 + 1) * 45
+    target = day_start + timedelta(minutes=next_bucket)
+    target = target.replace(second=0, microsecond=0) + timedelta(seconds=grace_seconds)
+
+    wait_sec = (target - now).total_seconds()
+    if wait_sec > 0:
+        print(f"⏳ wait until 45m close: {target.strftime('%Y-%m-%d %H:%M:%S %Z')} (wait {wait_sec:.1f}s)")
+        time.sleep(wait_sec)
+
 def wick_ok_by_direction(o, h, l, c, direction: str) -> bool:
     """
     direction = "LONG" or "SHORT"
@@ -137,16 +162,15 @@ def wick_ok_by_direction(o, h, l, c, direction: str) -> bool:
     lower_wick = max(0.0, min(o, c) - l)
 
     if direction == "LONG":
-        # 壞：上引線；好：下引線
         return (upper_wick <= body * MAX_BAD_WICK_TO_BODY_LONG) and \
                (lower_wick <= body * MAX_GOOD_WICK_TO_BODY_LONG)
 
     if direction == "SHORT":
-        # 壞：下引線；好：上引線
         return (lower_wick <= body * MAX_BAD_WICK_TO_BODY_SHORT) and \
                (upper_wick <= body * MAX_GOOD_WICK_TO_BODY_SHORT)
 
     return False
+
 def body_to_range_ratio(o, h, l, c) -> float:
     rng = max(h - l, 1e-12)
     body = abs(c - o)
@@ -224,7 +248,6 @@ def format_signal_text_for_tg(sig: Signal) -> str:
         f"🎯 目標一：{sig.tp1:.6g}\n"
         f"🎯 目標二：{sig.tp2:.6g}\n\n"
         f"📊 型態：45分K戰法\n"
-     #   f"⏰ 收線時間：{sig.candle_close_time_utc}\n"
         f"⚙️ 系統：Crypto Robert Auto Trader"
     )
 
@@ -316,7 +339,6 @@ def is_bearish_engulf(prev, cur, mode: str) -> bool:
     if mode == "range":
         return (cur_h >= prev_h) and (cur_l <= prev_l)
 
-    # body
     return (cur_o >= prev_c) and (cur_c <= prev_o)
 
 def is_bullish_engulf(prev, cur, mode: str) -> bool:
@@ -329,36 +351,24 @@ def is_bullish_engulf(prev, cur, mode: str) -> bool:
     if mode == "range":
         return (cur_h >= prev_h) and (cur_l <= prev_l)
 
-    # body
     return (cur_o <= prev_c) and (cur_c >= prev_o)
 
 def wick_body_ok(o, h, l, c, max_wick_to_body: float = 1.0) -> bool:
-    """
-    回傳 True 表示這根K棒的上下引線都不會超過實體。
-    規則：upper_wick <= body*max_ratio 且 lower_wick <= body*max_ratio
-    """
     o = float(o); h = float(h); l = float(l); c = float(c)
 
     body = abs(c - o)
-    if body <= 1e-12:  # doji 或近乎沒實體：直接視為不合格
+    if body <= 1e-12:
         return False
 
     upper_wick = h - max(o, c)
     lower_wick = min(o, c) - l
 
-    # 避免資料異常造成負值
     upper_wick = max(0.0, upper_wick)
     lower_wick = max(0.0, lower_wick)
 
     return (upper_wick <= body * max_wick_to_body) and (lower_wick <= body * max_wick_to_body)
 
 def compute_signal_only_if_last2_engulf(df45_closed: pd.DataFrame, symbol: str) -> Signal | None:
-    """
-    只看最後兩根 45m：
-    - 必須吞噬
-    - 吞噬K實體必須明顯大於被吞K（避免差不多長的假吞噬）
-    """
-
     if len(df45_closed) < 2:
         return None
 
@@ -371,15 +381,12 @@ def compute_signal_only_if_last2_engulf(df45_closed: pd.DataFrame, symbol: str) 
     prev_body = abs(prev_c - prev_o)
     cur_body  = abs(cur_c - cur_o)
 
-    # ❌ 排除：實體太小
     if cur_body <= 1e-12 or prev_body <= 1e-12:
         return None
 
-    # ❌ 排除：吞噬強度不足（你現在要的重點）
     if cur_body < prev_body * MIN_ENGULF_BODY_RATIO:
         return None
 
-    # 原本實體比例濾網
     ratio = body_to_range_ratio(cur_o, cur_h, cur_l, cur_c)
     if ratio < MIN_BODY_TO_RANGE:
         return None
@@ -427,6 +434,7 @@ def compute_signal_only_if_last2_engulf(df45_closed: pd.DataFrame, symbol: str) 
         r=abs(r),
         reason=reason,
     )
+
 # =========================================================
 # Plot (optional)
 # =========================================================
@@ -453,7 +461,7 @@ def plot(df45_closed: pd.DataFrame, sig: Signal, bars: int = 140):
     plt.show()
 
 # =========================================================
-# Scan loop
+# Scan once
 # =========================================================
 def scan_once(state: dict):
     any_sig = False
@@ -468,10 +476,8 @@ def scan_once(state: dict):
 
             if sig:
                 any_sig = True
-                # ✅ console 只印紅框那坨
                 print(format_signal_block(sig))
 
-                # ✅ TG：預設「只要有訊號就送」(方便驗證)
                 if ENABLE_TG:
                     if SEND_TG_ONLY_IF_NEW:
                         if should_show(sym, sig.candle_close_time_utc, sig.direction, state):
@@ -479,12 +485,10 @@ def scan_once(state: dict):
                     else:
                         tg_send(format_signal_text_for_tg(sig))
 
-                # plot（預設關）
                 if PLOT_ON_SIGNAL:
                     plot(df45_closed, sig, bars=PLOT_BARS)
 
         except Exception as e:
-            # 只印一行錯誤，避免爆 LOG
             print(f"❌ scan error for {sym}: {e}")
 
     if (not any_sig) and SHOW_NO_SIGNAL_MSG:
@@ -497,12 +501,10 @@ def run_every_45m():
         save_state(state)
         time.sleep(45 * 60)
 
-#if __name__ == "__main__":
-    # ✅ 開機先測試 TG，讓你立刻知道 token/chat_id/權限有沒有問題
-
-  #  run_every_45m()
-    
 if __name__ == "__main__":
+    # ✅ 關鍵：永遠等到下一個 45 分收線點（台灣時間）後才開始跑
+    wait_until_next_45m_close(grace_seconds=GRACE_SECONDS, tz_name="Asia/Taipei")
+
     state = load_state()
     scan_once(state)
     save_state(state)
